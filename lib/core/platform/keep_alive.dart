@@ -9,7 +9,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 ///
 /// The timer itself stays in the main isolate; the service's TaskHandler is
 /// intentionally a no-op. Its only job is to stop Android killing us.
-class KeepAlive {
+class SessionKeepAlive {
   static bool _initialised = false;
 
   static void _init() {

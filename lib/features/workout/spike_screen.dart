@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:ui' show FontFeature;
 
 import 'package:flutter/material.dart';
 
@@ -24,12 +23,16 @@ class SpikeScreen extends StatefulWidget {
 }
 
 class _SpikeScreenState extends State<SpikeScreen> {
-  // Spike parameters: 3-minute round, a cue every 6 seconds.
-  static const _roundLength = Duration(minutes: 3);
+  // Spike parameters: selectable round length, a cue every N seconds.
+  static const _lengthOptions = [1, 3, 10, 15]; // minutes
+  static const _intervalOptions = [4, 6, 8]; // seconds
 
-  final RoundClock _clock = RoundClock(roundLength: _roundLength);
-  final CueScheduler _scheduler =
-      CueScheduler(interval: const Duration(seconds: 6));
+  int _lengthMin = 3;
+  int _intervalSec = 6;
+
+  late RoundClock _clock = RoundClock(roundLength: Duration(minutes: _lengthMin));
+  late CueScheduler _scheduler =
+      CueScheduler(interval: Duration(seconds: _intervalSec));
   final CueSpeaker _speaker = CueSpeaker();
   final AudioFocus _focus = AudioFocus();
   final Haptics _haptics = Haptics();
@@ -40,7 +43,9 @@ class _SpikeScreenState extends State<SpikeScreen> {
   int _lastNotifBucket = -1;
   String _currentCallout = '';
   final List<String> _log = [];
-  Duration _remaining = _roundLength;
+  late Duration _remaining = Duration(minutes: _lengthMin);
+
+  bool get _active => _phase == _Phase.running || _phase == _Phase.paused;
 
   @override
   void initState() {
@@ -54,29 +59,34 @@ class _SpikeScreenState extends State<SpikeScreen> {
     _ticker?.cancel();
     _speaker.stop();
     _focus.release();
-    KeepAlive.stop();
+    SessionKeepAlive.stop();
     super.dispose();
   }
 
   void _logEvent(String text) {
     _log.insert(0, '${_fmt(_clock.elapsed)}  $text');
-    if (_log.length > 80) _log.removeLast();
+    if (_log.length > 120) _log.removeLast();
     if (mounted) setState(() {});
   }
 
   Future<void> _start() async {
-    if (_phase == _Phase.running || _phase == _Phase.paused) return;
-    await KeepAlive.start();
+    if (_active) return;
+    await SessionKeepAlive.start();
     final granted = await _focus.request(onEvent: _logEvent);
 
-    _clock.reset();
-    _scheduler.reset();
+    // Fresh clock and scheduler from the chosen settings.
+    _clock = RoundClock(roundLength: Duration(minutes: _lengthMin));
+    _scheduler = CueScheduler(interval: Duration(seconds: _intervalSec));
     _cueIndex = 0;
     _lastNotifBucket = -1;
     _currentCallout = '';
-    _remaining = _roundLength;
+    _remaining = _clock.roundLength;
     _log.clear();
     if (!granted) _logEvent('audio focus NOT granted');
+    _logEvent(
+      'vibrator available: ${await _haptics.isAvailable()} | '
+      'round ${_lengthMin}m, cue every ${_intervalSec}s',
+    );
 
     _phase = _Phase.running;
     _clock.start();
@@ -113,14 +123,14 @@ class _SpikeScreenState extends State<SpikeScreen> {
     final bucket = rem.inSeconds ~/ 5;
     if (bucket != _lastNotifBucket) {
       _lastNotifBucket = bucket;
-      KeepAlive.updateNotification('Remaining ${_fmt(rem)}');
+      SessionKeepAlive.updateNotification('Remaining ${_fmt(rem)}');
     }
     if (mounted) setState(() => _remaining = rem);
   }
 
   /// [natural] true = the round ran out; false = the user pressed End.
   Future<void> _end({required bool natural}) async {
-    if (_phase != _Phase.running && _phase != _Phase.paused) return;
+    if (!_active) return;
     _phase = _Phase.done;
     _ticker?.cancel();
     _clock.pause();
@@ -137,7 +147,7 @@ class _SpikeScreenState extends State<SpikeScreen> {
       _logEvent('ended early by user');
     }
     await _focus.release();
-    await KeepAlive.stop();
+    await SessionKeepAlive.stop();
   }
 
   void _pauseResume() {
@@ -162,9 +172,35 @@ class _SpikeScreenState extends State<SpikeScreen> {
     return '$m:$s';
   }
 
+  Widget _optionRow<T>({
+    required String label,
+    required List<T> options,
+    required T selected,
+    required String Function(T) text,
+    required void Function(T) onSelected,
+  }) {
+    return Row(
+      children: [
+        SizedBox(width: 64, child: Text(label)),
+        Expanded(
+          child: Wrap(
+            spacing: 8,
+            children: [
+              for (final o in options)
+                ChoiceChip(
+                  label: Text(text(o)),
+                  selected: o == selected,
+                  onSelected: _active ? null : (_) => onSelected(o),
+                ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final active = _phase == _Phase.running || _phase == _Phase.paused;
     return Scaffold(
       appBar: AppBar(title: const Text('Fightcraft: Phase 0 spike')),
       body: SafeArea(
@@ -183,7 +219,7 @@ class _SpikeScreenState extends State<SpikeScreen> {
               const SizedBox(height: 8),
               // Visual backup for the spoken cue (PRD 4.4, 12).
               SizedBox(
-                height: 96,
+                height: 80,
                 child: Center(
                   child: Text(
                     _currentCallout,
@@ -192,27 +228,44 @@ class _SpikeScreenState extends State<SpikeScreen> {
                   ),
                 ),
               ),
+              _optionRow<int>(
+                label: 'Round',
+                options: _lengthOptions,
+                selected: _lengthMin,
+                text: (v) => '$v min',
+                onSelected: (v) => setState(() {
+                  _lengthMin = v;
+                  if (!_active) _remaining = Duration(minutes: v);
+                }),
+              ),
+              _optionRow<int>(
+                label: 'Cue every',
+                options: _intervalOptions,
+                selected: _intervalSec,
+                text: (v) => '$v s',
+                onSelected: (v) => setState(() => _intervalSec = v),
+              ),
               const SizedBox(height: 8),
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   FilledButton(
-                    onPressed: active ? null : _start,
+                    onPressed: _active ? null : _start,
                     child: const Text('Start'),
                   ),
                   const SizedBox(width: 12),
                   OutlinedButton(
-                    onPressed: active ? _pauseResume : null,
+                    onPressed: _active ? _pauseResume : null,
                     child: Text(_phase == _Phase.paused ? 'Resume' : 'Pause'),
                   ),
                   const SizedBox(width: 12),
                   OutlinedButton(
-                    onPressed: active ? () => _end(natural: false) : null,
+                    onPressed: _active ? () => _end(natural: false) : null,
                     child: const Text('End'),
                   ),
                 ],
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 12),
               const Align(
                 alignment: Alignment.centerLeft,
                 child: Text('Event log (elapsed, lateness, cue / audio events)'),
